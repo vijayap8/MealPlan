@@ -1,0 +1,511 @@
+import os
+os.environ["FDC_API_KEY"] = "your API key here"
+print("FDC_API_KEY set:", len(os.environ["FDC_API_KEY"]) > 0)
+
+#Matching ingredients to fdcid from usda
+!pip -q install pandas requests tqdm gensim
+
+import os, re, json, time, hashlib, math
+from pathlib import Path
+import requests
+import pandas as pd
+from tqdm import tqdm
+import gensim.downloader as api
+import numpy as np
+
+BASE = "https://api.nal.usda.gov/fdc/v1"
+INPUT_PATH = "/content/sample_data/Ingredientslistall.csv"
+OVERRIDE_PATH = "/content/sample_data/Brieffdcidoverride.csv"
+
+TOP_SEARCH = 25
+TOPK_REVIEW = 10
+
+ALLOWED_DATA_TYPES = ["Foundation", "SR Legacy", "Survey (FNDDS)"]
+DT_PRIORITY = {dt: i for i, dt in enumerate(ALLOWED_DATA_TYPES)}
+
+W_SEM, W_CONTAIN, W_JACC = 0.60, 0.25, 0.15
+SEM_ALLOW_THRESHOLD = 0.40
+
+ANCHOR_BONUS = 8.0
+
+# NEW: derived-form penalties
+FLOUR_TOKENS = {"flour", "besan", "meal"}
+FLOUR_MISMATCH_PENALTY = 35.0   # ingredient NOT flour, candidate IS flour
+FLOUR_MATCH_BONUS = 10.0        # ingredient IS flour, candidate matches flour tokens
+
+# NEW: stronger Greek enforcement when ingredient says Greek yogurt
+GREEK_MATCH_BONUS = 10.0
+GREEK_MISS_PENALTY = 25.0       # only applied if "greek" exists in candidate pool
+
+# modifiers/penalties already in your pipeline
+MOD_MATCH_BONUS = 6.0
+MOD_MISS_PENALTY = 8.0
+BREADLIKE_PENALTY = 18.0
+
+LOW_IDF_Q = 0.35
+CTX_WEIGHT = 0.25
+MOD_WEIGHT = 0.35
+SECONDARY_WEIGHT = 0.20
+
+BAD_DESC_PENALTIES = {"babyfood": 25, "infant": 25, "prepared": 12}
+
+STOP = {
+    "for","with","and","or",
+    "chopped","diced","sliced","minced","ground","crushed","canned",
+    "cooked","raw","fresh","frozen","boiled","steamed","roasted","toasted","peeled","grated",
+    "cup","cups","tbsp","tablespoon","tsp","teaspoon","g","gm","gms","gram","grams",
+    "kg","ml","l","oz","lb","approx","approximately","about","serving","size","pinch","dash",
+    "small","medium","large"
+}
+
+SECONDARY = {
+    "clove","cloves","slice","slices","piece","pieces","bunch","sprig","stalk","stalks",
+    "seed","seeds","powder","paste","puree","pureed","mix","mixture"
+}
+
+# Keep these; do NOT drop brown anymore
+MODIFIERS = {
+    "brown","white","red","green","black","yellow",
+    "whole","wheat","greek","plain","nonfat","lowfat","fatfree",
+    "unsweetened","salted","unsalted"
+}
+
+BREADLIKE = {"bread","bun","buns","pancake","pancakes","tortilla","wrap","cracker","crackers","cake","cakes"}
+
+GENERIC_NOT_ANCHOR = set(SECONDARY) | set(MODIFIERS) | {"spice","spices","snack","snacks","dry","dried","sauce","soup"} | FLOUR_TOKENS
+
+ALIASES = {
+    "lauki": ["bottle gourd", "opo squash", "calabash"],
+    "bottle gourd": ["opo squash", "calabash"],
+    "paneer": ["indian cottage cheese"],
+}
+
+# API key
+if not os.environ.get("FDC_API_KEY"):
+    from getpass import getpass
+    os.environ["FDC_API_KEY"] = getpass("Enter FoodData Central API key: ").strip()
+API_KEY = os.environ["FDC_API_KEY"]
+if not API_KEY:
+    raise ValueError("FDC_API_KEY is empty.")
+
+# Cache
+CACHE_DIR = Path("/content/fdc_cache")
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+def _cache_path(prefix: str, payload: dict) -> Path:
+    s = json.dumps(payload, sort_keys=True, ensure_ascii=True)
+    h = hashlib.sha256(s.encode("utf-8")).hexdigest()
+    return CACHE_DIR / f"{prefix}_{h}.json"
+
+sess = requests.Session()
+
+def cached_post(url: str, params: dict, json_body: dict, prefix: str, timeout=(10, 60), max_retries=6, pace_s=0.01):
+    payload = {"url": url, "params": params, "json": json_body}
+    fp = _cache_path(prefix, payload)
+    if fp.exists():
+        return json.loads(fp.read_text())
+    for attempt in range(max_retries):
+        time.sleep(pace_s)
+        r = sess.post(url, params=params, json=json_body, timeout=timeout)
+        if r.status_code == 429:
+            time.sleep(2 ** attempt)
+            continue
+        r.raise_for_status()
+        fp.write_text(r.text)
+        return r.json()
+    raise RuntimeError(f"POST failed: {url}")
+
+def cached_get(url: str, params: dict, prefix: str, timeout=(10, 60), max_retries=6, pace_s=0.01):
+    payload = {"url": url, "params": params}
+    fp = _cache_path(prefix, payload)
+    if fp.exists():
+        try:
+            return json.loads(fp.read_text())
+        except Exception:
+            return {"__http_status__": 404}
+    for attempt in range(max_retries):
+        time.sleep(pace_s)
+        r = sess.get(url, params=params, timeout=timeout)
+        if r.status_code == 429:
+            time.sleep(2 ** attempt)
+            continue
+        if r.status_code == 404:
+            fp.write_text(r.text)
+            return {"__http_status__": 404}
+        r.raise_for_status()
+        fp.write_text(r.text)
+        return r.json()
+    raise RuntimeError(f"GET failed: {url}")
+
+def fdc_search(query: str, page_size: int = TOP_SEARCH):
+    body = {"query": query, "pageSize": page_size, "pageNumber": 1, "dataType": ALLOWED_DATA_TYPES}
+    return cached_post(f"{BASE}/foods/search", params={"api_key": API_KEY}, json_body=body, prefix="match_chickpea_greek_v1")
+
+def fdc_desc_for_id(fdcId: int) -> str:
+    j = cached_get(f"{BASE}/food/{int(fdcId)}", params={"api_key": API_KEY}, prefix="desc_only_chickpea_greek_v1")
+    if isinstance(j, dict) and j.get("__http_status__") == 404:
+        return ""
+    return (j.get("description") or "")
+
+# Read input/overrides (encoding fix inline)
+df_raw = pd.read_csv(INPUT_PATH, encoding="cp1252", encoding_errors="replace")
+ov = pd.read_csv(OVERRIDE_PATH, encoding="cp1252", encoding_errors="replace")
+
+def normcol(c): return re.sub(r"[^a-z0-9]+", "", str(c).strip().lower())
+def find_col(cols, candidates):
+    cols_n = {normcol(c): c for c in cols}
+    for cand in candidates:
+        k = normcol(cand)
+        if k in cols_n:
+            return cols_n[k]
+    for cand in candidates:
+        k = normcol(cand)
+        for cn, orig in cols_n.items():
+            if k in cn:
+                return orig
+    return None
+
+ing_col = find_col(df_raw.columns, ["ingredient","food","item","ingredientname"])
+if ing_col is None:
+    raise ValueError(f"Could not detect ingredient column. Columns: {list(df_raw.columns)}")
+
+df = df_raw.copy()
+df["ingredient"] = df[ing_col].astype(str).str.strip()
+unique_ings = sorted(df["ingredient"].dropna().unique().tolist())
+
+ov_norm = {normcol(c): c for c in ov.columns}
+ov_ing = ov_norm.get("ingredient")
+if ov_ing is None:
+    raise ValueError(f"Override must include ingredient column. Columns: {list(ov.columns)}")
+
+ov_fdc = None
+for cand in ["fdcid","fdcidoverride","fdcid_override"]:
+    if cand in ov_norm:
+        ov_fdc = ov_norm[cand]; break
+if ov_fdc is None:
+    for k, orig in ov_norm.items():
+        if "fdc" in k and "id" in k:
+            ov_fdc = orig; break
+if ov_fdc is None:
+    raise ValueError(f"Override must include an fdcId column. Columns: {list(ov.columns)}")
+
+ov = ov[[ov_ing, ov_fdc]].copy()
+ov.columns = ["ingredient","fdcId_override"]
+ov["ingredient"] = ov["ingredient"].astype(str).str.strip()
+ov["fdcId_override"] = pd.to_numeric(ov["fdcId_override"], errors="coerce")
+ov = ov.dropna(subset=["fdcId_override"])
+ov["fdcId_override"] = ov["fdcId_override"].astype(int)
+override_dict = dict(zip(ov["ingredient"], ov["fdcId_override"]))
+
+print("Loaded:", INPUT_PATH)
+print("Ingredient column:", ing_col)
+print("Rows:", len(df), "| Unique ingredients:", len(unique_ings))
+print("Overrides loaded:", len(override_dict))
+
+def clean_text(s: str) -> str:
+    s = str(s)
+    s = s.replace("purÃ©e", "puree").replace("purée", "puree")
+    s = s.replace("Â", "").replace("â‰ˆ", " ").replace("¼", " ").replace("½"," ").replace("¾"," ")
+    s = s.lower()
+    s = re.sub(r"\([^)]*\d[^)]*\)", " ", s)
+    s = re.sub(r"[^a-z0-9\s-]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def expand_aliases(s: str) -> str:
+    out = s
+    for k, exps in ALIASES.items():
+        if re.search(rf"\b{re.escape(k)}\b", s):
+            out += " " + " ".join(exps)
+    return out
+
+def norm_token(t: str) -> str:
+    if len(t) > 3 and t.endswith("s"):
+        return t[:-1]
+    return t
+
+def identity_part(text: str) -> str:
+    s = expand_aliases(clean_text(text))
+    return s.split(" for ", 1)[0].strip()
+
+def toks(text: str) -> list[str]:
+    s = identity_part(text)
+    out = [norm_token(t) for t in s.replace("-", " ").split() if len(t) > 1]
+    return [t for t in out if t not in STOP]
+
+def split_tokens(tlist: list[str]):
+    mods = [t for t in tlist if t in MODIFIERS]
+    sec  = [t for t in tlist if t in SECONDARY]
+    head = [t for t in tlist if (t not in MODIFIERS and t not in SECONDARY)]
+    return head, mods, sec
+
+def better_query(ingredient: str) -> str:
+    head, mods, sec = split_tokens(toks(ingredient))
+    q = head + mods + sec
+    return " ".join(q) if q else clean_text(ingredient)
+
+def penalty(desc: str) -> float:
+    d = clean_text(desc)
+    p = 0.0
+    for pat, w in BAD_DESC_PENALTIES.items():
+        if pat in d:
+            p += w
+    return p
+
+# word vectors
+print("\nLoading word vectors (downloads once)...")
+wv = api.load("glove-wiki-gigaword-100")
+print("Loaded vectors:", wv.vector_size)
+
+# pseudo-embeddings from overrides (OOV tokens)
+pseudo_sum, pseudo_cnt = {}, {}
+
+def add_pseudo(token: str, ctx_vecs: list[np.ndarray]):
+    if not ctx_vecs:
+        return
+    v = np.mean(ctx_vecs, axis=0)
+    pseudo_sum[token] = pseudo_sum.get(token, 0) + v
+    pseudo_cnt[token] = pseudo_cnt.get(token, 0) + 1
+
+print("Building pseudo-embeddings from overrides (descriptions only)...")
+for ing, fid in tqdm(list(override_dict.items()), desc="Pseudo-embed"):
+    desc = fdc_desc_for_id(fid)
+    ing_tokens = toks(ing)
+    desc_tokens = [norm_token(t) for t in expand_aliases(clean_text(desc)).replace("-", " ").split() if len(t) > 1]
+    desc_tokens = [t for t in desc_tokens if t not in STOP]
+    ctx = [wv[t] for t in (ing_tokens + desc_tokens) if t in wv]
+    for t in ing_tokens:
+        if t not in wv:
+            add_pseudo(t, ctx)
+
+pseudo_vec = {}
+for t in pseudo_sum:
+    v = pseudo_sum[t] / max(1, pseudo_cnt[t])
+    n = np.linalg.norm(v)
+    pseudo_vec[t] = (v / n) if n > 0 else v
+
+def get_vec(token: str):
+    if token in wv:
+        return wv[token]
+    if token in pseudo_vec:
+        return pseudo_vec[token]
+    return None
+
+def phrase_vec_weighted(tokens: list[str], weights: list[float]):
+    vecs, ws = [], []
+    for t, w in zip(tokens, weights):
+        v = get_vec(t)
+        if v is None:
+            continue
+        vecs.append(v); ws.append(w)
+    if not vecs:
+        return None
+    V = np.vstack(vecs)
+    W = np.array(ws).reshape(-1, 1)
+    v = (V * W).sum(axis=0) / max(1e-9, W.sum())
+    n = np.linalg.norm(v)
+    return v / n if n > 0 else None
+
+def cosine(a, b):
+    if a is None or b is None:
+        return None
+    return float(np.dot(a, b))
+
+def compute_idf(cand_sets: list[set[str]]):
+    N = len(cand_sets)
+    dfc = {}
+    for s in cand_sets:
+        for t in s:
+            dfc[t] = dfc.get(t, 0) + 1
+    return {t: (math.log((N + 1) / (d + 1)) + 1.0) for t, d in dfc.items()}
+
+def weights_for(head, mods, sec, idf):
+    all_t = head + mods + sec
+    vals = [idf.get(t, 1.0) for t in all_t]
+    if not vals:
+        return all_t, []
+    thresh = float(np.quantile(vals, LOW_IDF_Q))
+    w = []
+    for t, v in zip(all_t, vals):
+        ww = v
+        if v <= thresh:
+            ww *= CTX_WEIGHT
+        if t in mods:
+            ww *= MOD_WEIGHT
+        if t in sec:
+            ww *= SECONDARY_WEIGHT
+        w.append(ww)
+    return all_t, w
+
+def contain_and_jacc(A: set[str], B: set[str]):
+    if not A or not B:
+        return 0.0, 0.0
+    inter = len(A & B)
+    contain = inter / len(A)
+    jacc = inter / len(A | B) if (A | B) else 0.0
+    return contain, jacc
+
+def pick_anchor(head_tokens, idf, cand_sets):
+    present = set().union(*cand_sets) if cand_sets else set()
+    cands = []
+    for t in head_tokens:
+        if t in GENERIC_NOT_ANCHOR:
+            continue
+        if t in present:
+            cands.append((idf.get(t, 1.0), t))
+    if not cands:
+        return None
+    cands.sort(reverse=True)
+    return cands[0][1]
+
+# MATCHING ONLY
+mapping_rows, review_rows = [], []
+
+for ing in tqdm(unique_ings, desc="Matching"):
+    if ing in override_dict:
+        mapping_rows.append({
+            "ingredient": ing, "query_used": None, "fdcId": int(override_dict[ing]),
+            "fdc_dataType": "OVERRIDE", "fdc_desc": None, "score_0_100": None,
+            "anchor_token": None, "method": "override"
+        })
+        continue
+
+    q = better_query(ing)
+    res = fdc_search(q, page_size=TOP_SEARCH)
+    foods = [f for f in (res.get("foods") or []) if f.get("dataType") in ALLOWED_DATA_TYPES]
+    if not foods:
+        mapping_rows.append({
+            "ingredient": ing, "query_used": q, "fdcId": None,
+            "fdc_dataType": None, "fdc_desc": None, "score_0_100": None,
+            "anchor_token": None, "method": "unmapped"
+        })
+        continue
+
+    cand_desc = [(f, f.get("description","") or "") for f in foods]
+    cand_sets = [set(toks(desc)) for _, desc in cand_desc]
+    idf = compute_idf(cand_sets)
+    present_tokens = set().union(*cand_sets) if cand_sets else set()
+
+    ing_all = toks(ing)
+    head, mods, sec = split_tokens(ing_all)
+
+    head_set = set(head)
+
+    # modifier enforcement only if modifier exists in candidate pool
+    present_mods = [m for m in mods if m in present_tokens]
+
+    # Special: Greek yogurt enforcement
+    wants_greek = ("yogurt" in set(ing_all) and "greek" in set(mods))
+    greek_in_pool = ("greek" in present_tokens)
+
+    # Derived form control: flour/besan/meal
+    wants_flour = (len(set(ing_all) & FLOUR_TOKENS) > 0)
+    flour_in_pool = (len(present_tokens & FLOUR_TOKENS) > 0)
+
+    anchor = pick_anchor(head, idf, cand_sets)
+
+    ing_tok_order, ing_w = weights_for(head, mods, sec, idf)
+    v_ing = phrase_vec_weighted(ing_tok_order, ing_w)
+
+    scored = []
+    for (f, desc), B in zip(cand_desc, cand_sets):
+        # head-gate
+        if head_set and len(head_set & B) == 0:
+            continue
+
+        contain, jacc = contain_and_jacc(set(ing_all), B)
+
+        v_desc = phrase_vec_weighted(list(B), [idf.get(t, 1.0) for t in B])
+        sem = cosine(v_ing, v_desc) or 0.0
+
+        if contain == 0.0 and jacc == 0.0 and sem < SEM_ALLOW_THRESHOLD:
+            continue
+
+        sem01 = (sem + 1.0) / 2.0
+        score = 100.0 * (W_SEM*sem01 + W_CONTAIN*contain + W_JACC*jacc)
+        score -= penalty(desc)
+
+        dt = f.get("dataType","") or ""
+        score += (2.0 if dt=="Foundation" else 1.0 if dt=="SR Legacy" else 0.0)
+
+        # generic modifier scoring
+        for m in present_mods:
+            if m in B:
+                score += MOD_MATCH_BONUS
+            else:
+                score -= MOD_MISS_PENALTY
+
+        # Strong Greek enforcement when relevant and available
+        if wants_greek and greek_in_pool:
+            if "greek" in B:
+                score += GREEK_MATCH_BONUS
+            else:
+                score -= GREEK_MISS_PENALTY
+
+        # Flour/besan/meal mismatch logic
+        if flour_in_pool:
+            cand_is_flour = (len(B & FLOUR_TOKENS) > 0)
+            if wants_flour:
+                if cand_is_flour:
+                    score += FLOUR_MATCH_BONUS
+                else:
+                    score -= FLOUR_MISMATCH_PENALTY  # want flour but didn't get it
+            else:
+                if cand_is_flour:
+                    score -= FLOUR_MISMATCH_PENALTY  # don't want flour but got it
+
+        # bread-like penalty
+        if (len(set(ing_all) & BREADLIKE) == 0) and (len(B & BREADLIKE) > 0):
+            score -= BREADLIKE_PENALTY
+
+        # anchor bonus
+        if anchor is not None and anchor in B:
+            score += ANCHOR_BONUS
+
+        scored.append((score, sem, contain, jacc, DT_PRIORITY.get(dt, 999), f))
+
+    if not scored:
+        mapping_rows.append({
+            "ingredient": ing, "query_used": q, "fdcId": None,
+            "fdc_dataType": None, "fdc_desc": None, "score_0_100": None,
+            "anchor_token": anchor, "method": "unmapped_after_gate"
+        })
+        continue
+
+    scored.sort(key=lambda x: (-x[0], x[4], -x[1]))
+    best_sc, best_sem, best_contain, best_jacc, _, best_f = scored[0]
+
+    mapping_rows.append({
+        "ingredient": ing,
+        "query_used": q,
+        "fdcId": int(best_f.get("fdcId")) if best_f.get("fdcId") is not None else None,
+        "fdc_dataType": best_f.get("dataType"),
+        "fdc_desc": best_f.get("description"),
+        "score_0_100": float(max(0.0, min(100.0, best_sc))),
+        "sem_cosine": float(best_sem),
+        "containment": float(best_contain),
+        "jaccard": float(best_jacc),
+        "anchor_token": anchor,
+        "method": "semantic_headgate_flour_greek"
+    })
+
+    for rank, (sc, sem, contain, jacc, _, f) in enumerate(scored[:TOPK_REVIEW], 1):
+        review_rows.append({
+            "ingredient": ing, "query_used": q, "rank": rank,
+            "score_0_100": float(max(0.0, min(100.0, sc))),
+            "sem_cosine": float(sem),
+            "containment": float(contain),
+            "jaccard": float(jacc),
+            "anchor_token": anchor,
+            "dataType": f.get("dataType"),
+            "fdcId": f.get("fdcId"),
+            "description": f.get("description"),
+        })
+
+pd.DataFrame(mapping_rows).to_csv("/content/mapping.csv", index=False)
+pd.DataFrame(review_rows).to_csv("/content/mapreview_topk.csv", index=False)
+pd.DataFrame(mapping_rows)[pd.DataFrame(mapping_rows)["fdcId"].isna()][["ingredient","query_used"]].to_csv("/content/matching_unmapped.csv", index=False)
+
+print("\nWrote: /content/mapping.csv")
+print("Wrote: /content/mapreview_topk.csv")
+print("Wrote: /content/matching_unmapped.csv")
