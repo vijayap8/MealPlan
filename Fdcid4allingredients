@@ -1,0 +1,36 @@
+import pandas as pd
+
+# File paths
+mapped_file = "/content/sample_data/mapping.csv"
+ingredients_file = "/content/sample_data/Ingredientslistall.csv"
+output_file = "fdcid4ingredient.csv"
+
+# Read CSV files
+mapped_df = pd.read_csv(mapped_file)
+ingredients_df = pd.read_csv(ingredients_file)
+
+# Clean merge columns
+mapped_df["Mingredient"] = mapped_df["Mingredient"].astype(str).str.strip()
+ingredients_df["AIngredient"] = ingredients_df["AIngredient"].astype(str).str.strip()
+
+# Keep only required columns
+mapped_subset = mapped_df[["Mingredient", "MfdcId"]].copy()
+
+# Merge mapped Mfdcid onto Ingredientslistall
+merged_df = ingredients_df.merge(
+    mapped_subset,
+    how="left",
+    left_on="AIngredient",
+    right_on="Mingredient"
+)
+
+# Remove extra key column
+merged_df = merged_df.drop(columns=["Mingredient"])
+
+# Save result
+merged_df.to_csv(output_file, index=False)
+
+print(f"Done. Output saved to {output_file}")
+print("Rows in output:", len(merged_df))
+print("Rows with Mfdcid mapped:", merged_df["MfdcId"].notna().sum())
+print(merged_df.head())
