@@ -1,0 +1,276 @@
+import time
+import pandas as pd
+import requests
+
+# =========================
+# 1) FILE PATHS
+# =========================
+input_file = "/content/sample_data/fdcidWithingredient.csv"
+output_file = "Nutrientall.csv"
+
+if "FDC_API_KEY" not in globals():
+    raise ValueError("FDC_API_KEY is not defined. Run a cell first with your API key.")
+
+# =========================
+# 2) READ INPUT
+# =========================
+df = pd.read_csv(input_file)
+df.columns = df.columns.str.strip()
+
+required_cols = ["Mfdcid", "Amount"]
+missing = [c for c in required_cols if c not in df.columns]
+if missing:
+    raise ValueError(f"Missing required columns: {missing}")
+
+df["Mfdcid"] = pd.to_numeric(df["Mfdcid"], errors="coerce")
+df["Amount"] = pd.to_numeric(df["Amount"], errors="coerce")
+
+print("Input columns:", df.columns.tolist())
+print("Rows:", len(df))
+print("Rows with valid Mfdcid:", df["Mfdcid"].notna().sum())
+print("Rows with valid Amount:", df["Amount"].notna().sum())
+
+# =========================
+# 3) USDA ENDPOINT + NUTRIENTS
+# =========================
+# USDA /v1/foods accepts up to 20 FDC IDs and the nutrients parameter expects
+# nutrient NUMBERS such as 203, 204, 205, not internal nutrient IDs.
+BASE_URL = "https://api.nal.usda.gov/fdc/v1/foods"
+
+NUTRIENTS = {
+    "208": "calories",        # Energy (kcal)
+    "203": "protein",         # Protein
+    "205": "carbohydrate",    # Carbohydrate, by difference
+    "606": "saturated_fat",   # Fatty acids, total saturated
+    "307": "sodium",          # Sodium, Na
+    "291": "fiber",           # Fiber, total dietary
+}
+
+# Existing columns in your file for optional fallback
+EXISTING_FALLBACK_COLS = {
+    "calories": "Calories",
+    "protein": "Protein (g)",
+    "carbohydrate": "Carbohydrates (g)",
+    "saturated_fat": "Saturated Fat (g)",
+    "sodium": "Sodium (mg)",
+    "fiber": "Fiber (g)",
+}
+
+# =========================
+# 4) HELPERS
+# =========================
+def chunk_list(items, chunk_size=20):
+    for i in range(0, len(items), chunk_size):
+        yield items[i:i + chunk_size]
+
+def safe_float(x):
+    try:
+        if x is None or pd.isna(x):
+            return None
+        return float(x)
+    except:
+        return None
+
+def normalize_name(x):
+    if x is None:
+        return ""
+    return str(x).strip().lower()
+
+def fetch_foods_batch(fdc_ids, api_key, max_retries=4):
+    """
+    Batch endpoint is more robust than /food/{fdcId} because invalid/not-found IDs
+    are omitted instead of causing a 404 for the whole run.
+    """
+    params = {
+        "api_key": api_key,
+        "fdcIds": ",".join(str(int(x)) for x in fdc_ids),
+        "format": "full",
+        "nutrients": ",".join(NUTRIENTS.keys())
+    }
+
+    for attempt in range(max_retries):
+        try:
+            r = requests.get(BASE_URL, params=params, timeout=60)
+
+            if r.status_code == 200:
+                return r.json()
+
+            if r.status_code in [429, 500, 502, 503, 504]:
+                wait_time = 2 ** attempt
+                print(f"Retryable error {r.status_code}. Waiting {wait_time}s")
+                time.sleep(wait_time)
+                continue
+
+            raise RuntimeError(f"API error {r.status_code}: {r.text[:300]}")
+
+        except requests.RequestException as e:
+            if attempt == max_retries - 1:
+                raise RuntimeError(f"Request failed after retries: {e}")
+            wait_time = 2 ** attempt
+            print(f"Request error: {e}. Waiting {wait_time}s")
+            time.sleep(wait_time)
+
+    raise RuntimeError("API request failed after retries.")
+
+def parse_food_nutrients(food_obj):
+    """
+    Parse nutrient values from returned food object.
+    Handles:
+      1) foodNutrients with nested nutrient.number + amount
+      2) abridged-like number/name/value shapes
+      3) labelNutrients fallback for branded foods
+    """
+    out = {k: None for k in NUTRIENTS.values()}
+
+    # Parse foodNutrients
+    for fn in food_obj.get("foodNutrients", []):
+        nutrient_number = None
+        nutrient_name = None
+        value = None
+
+        nutrient = fn.get("nutrient")
+        if isinstance(nutrient, dict):
+            nutrient_number = nutrient.get("number")
+            nutrient_name = nutrient.get("name")
+            value = fn.get("amount")
+
+        if nutrient_number is None:
+            nutrient_number = fn.get("number")
+
+        if nutrient_name is None:
+            nutrient_name = fn.get("name")
+
+        if value is None:
+            value = fn.get("amount")
+
+        if value is None:
+            value = fn.get("value")
+
+        nutrient_number = str(nutrient_number).strip() if nutrient_number is not None else None
+        nutrient_name = normalize_name(nutrient_name)
+        value = safe_float(value)
+
+        if value is None:
+            continue
+
+        if nutrient_number in NUTRIENTS:
+            out[NUTRIENTS[nutrient_number]] = value
+
+    # Parse labelNutrients fallback for branded foods
+    label = food_obj.get("labelNutrients", {}) or {}
+    label_map = {
+        "calories": "calories",
+        "protein": "protein",
+        "carbohydrate": "carbohydrates",
+        "saturated_fat": "saturatedFat",
+        "sodium": "sodium",
+        "fiber": "fiber",
+    }
+
+    for target_name, label_key in label_map.items():
+        if out[target_name] is not None:
+            continue
+        obj = label.get(label_key)
+        if isinstance(obj, dict):
+            val = safe_float(obj.get("value"))
+            if val is not None:
+                out[target_name] = val
+
+    return out
+
+# =========================
+# 5) FETCH UNIQUE FDC IDS
+# =========================
+unique_fdcids = (
+    df["Mfdcid"]
+    .dropna()
+    .astype(int)
+    .drop_duplicates()
+    .tolist()
+)
+
+print("Unique FDC IDs to fetch:", len(unique_fdcids))
+
+fdc_to_nutrients = {}
+
+for batch_num, batch_ids in enumerate(chunk_list(unique_fdcids, 20), start=1):
+    print(f"Fetching batch {batch_num} with {len(batch_ids)} IDs")
+    foods = fetch_foods_batch(batch_ids, FDC_API_KEY)
+
+    returned_ids = set()
+
+    for food in foods:
+        fdcid = food.get("fdcId")
+        if fdcid is None:
+            continue
+
+        fdcid = int(fdcid)
+        returned_ids.add(fdcid)
+        fdc_to_nutrients[fdcid] = parse_food_nutrients(food)
+
+    # Any omitted IDs are invalid/not found or otherwise missing
+    for missing_id in batch_ids:
+        if int(missing_id) not in returned_ids:
+            fdc_to_nutrients[int(missing_id)] = {k: None for k in NUTRIENTS.values()}
+
+    time.sleep(0.2)
+
+print("Finished fetching nutrient data.")
+
+# Show sample parsed values
+sample_ids = list(fdc_to_nutrients.keys())[:10]
+for sid in sample_ids:
+    print(sid, fdc_to_nutrients[sid])
+
+# =========================
+# 6) SCALE BY AMOUNT
+# =========================
+# Assumes Amount is grams and nutrient values are per 100 g
+def scale_row_nutrients(row):
+    result = {k: None for k in NUTRIENTS.values()}
+
+    fdcid = row["Mfdcid"]
+    amount = row["Amount"]
+
+    if pd.isna(fdcid) or pd.isna(amount):
+        return pd.Series(result)
+
+    nutrient_dict = fdc_to_nutrients.get(int(fdcid), {})
+    amount = float(amount)
+
+    for nutrient_name in result.keys():
+        val = nutrient_dict.get(nutrient_name)
+        if val is not None:
+            result[nutrient_name] = float(val) * amount / 100.0
+
+    return pd.Series(result)
+
+scaled = df.apply(scale_row_nutrients, axis=1)
+
+for nutrient_name in NUTRIENTS.values():
+    df[nutrient_name] = scaled[nutrient_name]
+
+# =========================
+# 7) FALLBACK TO EXISTING COLUMNS
+# =========================
+for nutrient_name, source_col in EXISTING_FALLBACK_COLS.items():
+    if source_col in df.columns:
+        df[nutrient_name] = df[nutrient_name].fillna(df[source_col])
+
+# =========================
+# 8) MISSINGNESS REPORT
+# =========================
+print("\nMissing counts after USDA parse + fallback:")
+for nutrient_name in NUTRIENTS.values():
+    print(f"{nutrient_name}: {df[nutrient_name].isna().sum()}")
+
+# =========================
+# 9) SAVE
+# =========================
+df.to_csv(output_file, index=False)
+
+print(f"\nDone. Saved file: {output_file}")
+print(df[
+    ["AIngredient", "Amount", "Mfdcid",
+     "calories", "protein", "carbohydrate", "saturated_fat", "sodium", "fiber"]
+].head(10))
